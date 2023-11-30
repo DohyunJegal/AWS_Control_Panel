@@ -237,6 +237,12 @@ def rebootAllInstances():
 
 
 def createMultipleInstances(ami_id, n):
+    try:
+        ec2.describe_images(ImageIds=[ami_id])
+    except ClientError as e:
+        print(f'No AMI \'{ami_id}\'\n--> {e}')
+        return
+
     if n.isnumeric():
         for i in range(int(n)):
             createInstance(ami_id)
