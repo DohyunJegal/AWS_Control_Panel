@@ -154,5 +154,6 @@ cython_debug/
 # 개인 키 관련
 .aws/config
 .aws/credentials
+cloud-ec2.pem
 
 .idea

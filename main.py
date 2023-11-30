@@ -1,6 +1,9 @@
+from datetime import datetime, timedelta
+from botocore.exceptions import ClientError
+
 import boto3
 import botocore
-from botocore.exceptions import ClientError
+import paramiko as paramiko
 
 # '.aws/config'에서 region 값 호출
 with open("./.aws/config") as config_file:
@@ -15,6 +18,7 @@ with open("./.aws/credentials") as credentials_file:
 
 # boto3 세션 객체 생성
 session = boto3.Session(aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, region_name=region)
+cloudwatch = boto3.client('cloudwatch', aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, region_name=region)
 
 # EC2 인스턴스 목록 가져오기
 ec2 = session.client('ec2')
@@ -26,7 +30,7 @@ def listInstance():
 
         for instance in instances['Reservations']:
             for instance_detail in instance['Instances']:
-                print(f'[id] {instance_detail["InstanceId"]} [AMI] {instance_detail["ImageId"]} [type] {instance_detail["InstanceType"]} [state] {instance_detail["State"]["Name"]:>10} [monitoring state] {instance_detail["Monitoring"]["State"]}')
+                print(f'[Name] {instance_detail["Tags"][0]["Value"]:>15} [id] {instance_detail["InstanceId"]} [AMI] {instance_detail["ImageId"]} [type] {instance_detail["InstanceType"]} [state] {instance_detail["State"]["Name"]:>10} [monitoring state] {instance_detail["Monitoring"]["State"]}')
 
         if 'NextToken' in instances:
             next_token = instances['NextToken']
@@ -36,7 +40,7 @@ def listInstance():
 
                 for instance in instances['Reservations']:
                     for instance_detail in instance['Instances']:
-                        print(f'[id] {instance_detail["InstanceId"]} [AMI] {instance_detail["ImageId"]} [type] {instance_detail["InstanceType"]} [state] {instance_detail["State"]["Name"]:>10} [monitoring state] {instance_detail["Monitoring"]["State"]}')
+                        print(f'[Name] {instance_detail["Tags"][0]["Value"]:>15} [id] {instance_detail["InstanceId"]} [AMI] {instance_detail["ImageId"]} [type] {instance_detail["InstanceType"]} [state] {instance_detail["State"]["Name"]:>10} [monitoring state] {instance_detail["Monitoring"]["State"]}')
 
                 next_token = instances.get('NextToken')
     except ClientError as e:
@@ -104,12 +108,22 @@ def createInstance(ami_id):
         print(f'No AMI \'{ami_id}\'\n--> {e}')
         return
 
+    print('Enter new instance name: ', end='')
+    new_instance_name = input().rstrip()
+
     try:
         new_instance = ec2.run_instances(
             ImageId=ami_id,
             InstanceType='t2.micro',
             MinCount=1,
-            MaxCount=1
+            MaxCount=1,
+            TagSpecifications=[{
+                'ResourceType': 'instance',
+                'Tags': [{
+                    'Key': 'Name',
+                    'Value': new_instance_name
+                }]
+            }]
         )
         new_instance_id = new_instance['Instances'][0]['InstanceId']
         print(f'Successfully created EC2 instance {new_instance_id} based on AMI {ami_id}')
@@ -157,6 +171,35 @@ def terminateInstance(instance_id):
         print(f'Failed to terminate instance {instance_id}: {e}')
 
 
+def instanceStatus():
+    try:
+        instance = ec2.describe_instances(InstanceIds=['i-0aec95ffbdd45add5'])
+    except ClientError as e:
+        print(f'There is no main instance\n--> {e}')
+        return
+
+    try:
+        public_ip = instance['Reservations'][0]['Instances'][0]['PublicIpAddress']
+    except KeyError as e:
+        print(f'No main instance running\n--> cannot get {e}')
+        return
+
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(hostname=public_ip, username='ec2-user', key_filename='./.aws/cloud-ec2.pem')
+
+        # Run the condor_status command
+        stdin, stdout, stderr = client.exec_command('condor_status')
+
+        # Print the output of the condor_status command
+        print(stdout.read().decode())
+
+        client.close()
+    except ClientError as e:
+        print(f'Failed to check status instance: {e}')
+
+
 def startAllInstances():
     try:
         instances = ec2.describe_instances()
@@ -201,19 +244,61 @@ def createMultipleInstances(ami_id, n):
         print('retry!')
 
 
+def checkUtilization(instance_id, start_time, end_time):
+    try:
+        ec2.describe_instances(InstanceIds=[instance_id])
+    except ClientError as e:
+        print(f'No instance \'{instance_id}\'\n--> {e}')
+        return
+
+    def checkCloudwatch(metric):
+        response = cloudwatch.get_metric_statistics(
+            Namespace='AWS/EC2',
+            MetricName=metric,
+            Dimensions=[{
+                'Name': 'InstanceId',
+                'Value': instance_id
+            }],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=3600,     # 1시간
+            Statistics=['Average']
+        )['Datapoints']
+
+        total_usage = sum(data['Average'] for data in response)
+        average_usage = total_usage/len(response)
+        max_usage = max(data['Average'] for data in response)
+        min_usage = min(data['Average'] for data in response)
+
+        print(f'[{metric}] average: {round(float(average_usage), 3)}, max: {round(float(max_usage), 3)}, min: {round(float(min_usage), 3)}')
+
+    print()
+    checkCloudwatch('CPUUtilization')
+    checkCloudwatch('DiskReadBytes')
+    checkCloudwatch('DiskReadOps')
+    checkCloudwatch('DiskWriteBytes')
+    checkCloudwatch('DiskWriteOps')
+    checkCloudwatch('NetworkIn')
+    checkCloudwatch('NetworkPacketsIn')
+    checkCloudwatch('NetworkOut')
+    checkCloudwatch('NetworkPacketsOut')
+
+
 if __name__ == "__main__":
     while True:
         print("                                                            ")
         print("------------------------------------------------------------")
         print("                  AWS Control Panel                         ")
         print("------------------------------------------------------------")
-        print("  1. list instance                2. available zones        ")
-        print("  3. start instance               4. available regions      ")
-        print("  5. stop instance                6. create instance        ")
-        print("  7. reboot instance              8. list images            ")
-        print("  9. terminate instance          10. start all instances    ")
-        print(" 11. stop all instances          12. reboot all instances   ")
-        print(" 13. create multiple instances   99. quit                   ")
+        print("  1. available regions            2. available zones        ")
+        print("  3. list images                  4. list instance          ")
+        print("  5. create instance              6. start instance         ")
+        print("  7. stop instance                8. reboot instance        ")
+        print("  9. terminate instance          10. check instance status  ")
+        print(" 11. start all instances         12. stop all instances     ")
+        print(" 13. reboot all instances        14. create multiple instances")
+        print(" 15. check instance utilization                             ")
+        print("                                 99. quit                   ")
         print("------------------------------------------------------------")
         print("Enter an integer: ", end='')
 
@@ -223,37 +308,37 @@ if __name__ == "__main__":
         print('')
 
         if menu == '1':
-            listInstance()
+            availableRegions()
         elif menu == '2':
             availableZones()
         elif menu == '3':
-            print('Enter instance id: ', end='')
-            instance_id = input().rstrip()
-
-            if instance_id != '':
-                startInstance(instance_id)
+            listImages()
         elif menu == '4':
-            availableRegions()
+            listInstance()
         elif menu == '5':
-            print('Enter instance id: ', end='')
-            instance_id = input().rstrip()
-
-            if instance_id != '':
-                stopInstance(instance_id)
-        elif menu == '6':
             print('Enter AMI id: ', end='')
             ami_id = input().rstrip()
 
             if ami_id != '':
                 createInstance(ami_id)
+        elif menu == '6':
+            print('Enter instance id: ', end='')
+            instance_id = input().rstrip()
+
+            if instance_id != '':
+                startInstance(instance_id)
         elif menu == '7':
             print('Enter instance id: ', end='')
             instance_id = input().rstrip()
 
             if instance_id != '':
-                rebootInstance(instance_id)
+                stopInstance(instance_id)
         elif menu == '8':
-            listImages()
+            print('Enter instance id: ', end='')
+            instance_id = input().rstrip()
+
+            if instance_id != '':
+                rebootInstance(instance_id)
         elif menu == '9':
             print('Enter instance id: ', end='')
             instance_id = input().rstrip()
@@ -261,12 +346,14 @@ if __name__ == "__main__":
             if instance_id != '':
                 terminateInstance(instance_id)
         elif menu == '10':
-            startAllInstances()
+            instanceStatus()
         elif menu == '11':
-            stopAllInstances()
+            startAllInstances()
         elif menu == '12':
-            rebootAllInstances()
+            stopAllInstances()
         elif menu == '13':
+            rebootAllInstances()
+        elif menu == '14':
             print('Enter AMI id: ', end='')
             ami_id = input().rstrip()
             print('Enter the number of instances : ', end='')
@@ -274,6 +361,15 @@ if __name__ == "__main__":
 
             if ami_id != '' and n != '':
                 createMultipleInstances(ami_id, n)
+        elif menu == '15':
+            print('Enter instance id: ', end='')
+            instance_id = input().rstrip()
+
+            print('Enter an integer to check the record from a few days ago.(value>0): ', end='')
+            d = input().rstrip()
+
+            if instance_id != '' and d != '' or '0':
+                checkUtilization(instance_id, datetime.now()-timedelta(days=int(d)), datetime.now())
         elif menu == '99':
             print('bye!')
             exit(0)
